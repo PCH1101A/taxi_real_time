@@ -1,0 +1,164 @@
+services:
+  # ── 1. Message Broker: Apache Kafka (KRaft Mode - No Zookeeper required) ─────
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: taxi-realtime-kafka
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      # Retention: keep 1 hour of data (prevent disk bloat on dev machine)
+      KAFKA_LOG_RETENTION_MS: 3600000
+      KAFKA_LOG_RETENTION_BYTES: 536870912   # 512 MB
+      KAFKA_LOG_SEGMENT_BYTES: 134217728     # 128 MB per segment
+    networks:
+      - taxi_stream_net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ── 1b. Kafka Init: Create topic with correct partition/retention config ────
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: taxi-realtime-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - taxi_stream_net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topic: taxi.trips.live ..."
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic taxi.trips.live \
+          --partitions 6 \
+          --replication-factor 1 \
+          --config retention.ms=3600000 \
+          --config segment.ms=600000 \
+          --config compression.type=gzip
+        echo "Topic created (or already exists). Listing topics:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+        echo "kafka-init complete."
+    restart: "no"
+
+  # ── 2. In-Memory State & PubSub: Redis ──────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: taxi-realtime-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - taxi_stream_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── 3. Simulator: NYC Taxi Live Trip Event Producer ────────────────────────────
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: taxi-realtime-simulator
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_TRIPS=taxi.trips.live
+      - SOURCE_MODE=PARQUET_REPLAY
+      - ENABLED_DATASETS=YELLOW,GREEN,FHVHV
+      - DATA_DIR=/app/data
+      - ZONE_JSON_PATH=/app/data/taxi_zones.json
+      - EVENTS_PER_SECOND=100.0
+      - BATCH_SIZE=50
+      - MAX_CONCURRENT_TRIPS=500
+      - QUEUE_MAX_SIZE=2000
+      - YELLOW_WEIGHT=0.40
+      - GREEN_WEIGHT=0.10
+      - FHVHV_WEIGHT=0.50
+      - YELLOW_MAX_ROWS=150000
+      - GREEN_MAX_ROWS=44238
+      - FHVHV_MAX_ROWS=200000
+      - ANOMALY_RATE=0.08
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - taxi_stream_net
+    restart: unless-stopped
+
+  # ── 4. Apache Flink Stream Processor Engine ──────────────────────────────────
+  flink-processor:
+    build:
+      context: ./flink_processor
+      dockerfile: Dockerfile
+    container_name: taxi-realtime-flink-processor
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_TRIPS=taxi.trips.live
+      - KAFKA_GROUP_ID=taxi-flink-processor-group
+      - REDIS_URL=redis://redis:6379/0
+      - SLIDING_WINDOW_SECONDS=60
+      - DENSITY_PUBLISH_INTERVAL=2.0
+      - DATA_PATH=/app/data/taxi_zones.json
+    volumes:
+      - ./data:/app/data:ro
+      - ./flink_processor:/app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - taxi_stream_net
+    restart: unless-stopped
+
+
+  # ── 5. Live Dashboard: Streamlit Real-Time Monitor ────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: taxi-realtime-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - REFRESH_INTERVAL_MS=2000
+    volumes:
+      - ./data:/app/data:ro
+      - ./dashboard:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - taxi_stream_net
+    restart: unless-stopped
+
+networks:
+  taxi_stream_net:
+    driver: bridge
+
+

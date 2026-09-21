@@ -1,0 +1,6 @@
+aiokafka==0.11.0
+pydantic==2.8.2
+pydantic-settings==2.4.0
+numpy==1.26.4
+pyarrow==17.0.0
+python-dotenv==1.0.1

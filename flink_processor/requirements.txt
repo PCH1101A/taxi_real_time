@@ -1,0 +1,4 @@
+apache-flink>=1.18.0,<1.19.0
+redis>=5.0.0
+pytz>=2024.1
+numpy>=1.24.0
