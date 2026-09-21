@@ -1,146 +1,215 @@
-# Luồng Dữ Liệu — NYC Taxi Real-Time Pipeline
+# 🌊 Kiến Trúc Luồng Dữ Liệu — NYC Taxi Real-Time Pipeline
 
-```
-Parquet / Synthetic ──► Kafka ──► Stream Processor (Flink) ──► Redis ──► Dashboard (Streamlit) ──► Browser
-```
-
----
-
-## TẦNG 1 — Simulator & Data Ingestion
-
-**Files:** `simulator/trip_generator.py` · `simulator/kafka_producer.py` · `simulator/config.py`
-
-- Hỗ trợ đầy đủ **3 loại taxi NYC TLC**:
-  - 🟡 **Yellow Taxi (`YELLOW`):** Xe taxi truyền thống khu vực trung tâm Manhattan & sân bay (ID: `yt-*`).
-  - 🟢 **Green Taxi (`GREEN`):** Boro Taxi phục vụ Outer Boroughs & Upper Manhattan (ID: `gt-*`).
-  - 🟣 **FHVHV (`FHVHV`):** High-Volume For-Hire Vehicle — Uber, Lyft, Via (ID: `hv-*`).
-- **2 Chế độ nạp dữ liệu (`SOURCE_MODE`)**:
-  - `PARQUET_REPLAY`: Nạp và phát lại từ file dữ liệu thực tế NYC TLC Parquet 19 cột canonical.
-  - `SYNTHETIC_STREAM`: Sinh dữ liệu ngẫu nhiên đa luồng theo trọng số phân bổ 265 Taxi Zones NYC (Yellow 40%, Green 10%, FHVHV 50%).
-- **Vòng đời sự kiện chuyến xe (3 trạng thái)**:
-  `TRIP_STARTED` ──► `LOCATION_PING` (Nội suy tọa độ GPS, tốc độ mph, cước phí lũy tiến) ──► `TRIP_COMPLETED`
-- Duy trì đồng thời **300+ đến 500+ xe (`MAX_CONCURRENT_TRIPS`)**, sản sinh **20–100 events/giây** đẩy liên tục vào Kafka.
+> **Tài liệu đặc tả kiến trúc luồng dữ liệu thời gian thực (End-to-End Data Pipeline Architecture)**  
+> Mô phỏng, xử lý luồng và trực quan hóa hơn 500 xe taxi di chuyển đồng thời trên 265 Taxi Zones tại New York City.
 
 ---
 
-## TẦNG 2 — Message Broker (Apache Kafka)
+## 🏛️ Sơ Đồ Kiến Trúc Luồng Tổng Thể (End-to-End Architecture)
 
-**Topic:** `taxi.trips.live` · 3 Partitions · KRaft Mode (`apache/kafka:3.8.0`)
-
-- Tiếp nhận toàn bộ event vi mô từ Simulator kèm metadata định danh (`dataset_source`, `trip_id`, `speed_mph`, `fare_amount`, `progress_ratio`, tọa độ GPS).
-- **Phân tách tốc độ (Decoupling Buffer)**: Producer đẩy nhanh (20–100 evt/s), Consumer đọc ổn định theo batch, bảo toàn dữ liệu khi downstream tải nặng.
-- Consumer Group: `taxi-stream-processor-group` với `auto_offset_reset=latest` (xử lý ngay dữ liệu mới nhất).
-
----
-
-## TẦNG 3 — Stream Processing Engine (Apache Flink / Streaming Processor)
-
-**Files:** `flink_processor/flink_streaming_job.py` · `flink_processor/config.py`
-
-Mỗi sự kiện từ Kafka được nạp vào **`FlinkStreamEngine`**:
-1. **Sliding Window 60s (`_vehicles`)**: Lưu trạng thái vị trí, tốc độ, cước phí và tiến trình di chuyển của từng xe. Tự động dọn dẹp các xe stale (không có ping > 60s) để tránh hiển thị "xe ma".
-2. **Zone Density Aggregator (265 Zones)**: Phân loại mức độ ùn tắc theo 4 cấp độ (`LOW` < 3 xe, `MODERATE` 3–6 xe, `HEAVY` 7–11 xe, `CRITICAL` ≥ 12 xe).
-3. **Bản Đồ Quyền Lực Đội Xe (Fleet Power Map Engine)**:
-   - `ZonePowerTracker` ứng dụng **thuật toán Gaussian Welford Online** theo dõi tỷ lệ chiếm lĩnh thị phần ($Mean\ \mu$, $Variance\ \sigma^2$) của từng đội xe trên từng phân vùng với độ phức tạp không gian $O(1)$.
-   - Tính **Invasion Z-Score**: $Z = \frac{Ratio_{current} - \mu}{\sigma}$. Phát hiện cảnh báo xâm lấn thị phần khi $Z > 1.6\sigma$ hoặc $Z > 2.0\sigma$.
-   - Xác định khu vực tranh chấp (**Contested Zones** khi khoảng cách giữa 2 đội xe dẫn đầu < 15%).
-4. **Phát tán trạng thái định kỳ (2s tick interval)**: Tổng hợp và ghi đồng bộ toàn bộ snapshot metrics vào Redis thông qua pipeline.
-
----
-
-## TẦNG 4 — In-Memory State & Pub/Sub Store (Redis 7.2)
-
-**Keys & Channels chính:**
-- `kv:latest_density_metrics`: Lưu snapshot mật độ 265 zones, danh sách xe active, phân bố 3 đội xe và top điểm nóng.
-- `kv:power_map_snapshot`: Lưu riêng danh sách `invasion_zones` và thống kê `territory_counts` (TTL 10s — tự hủy nếu luồng dừng để tránh dữ liệu rác).
-- `hash:realtime_kpis`: Bộ đếm tổng sự kiện `total_events_processed`, tổng xe active `total_active_vehicles`, và timestamp cập nhật.
-- `channel:density_metrics`: Kênh Pub/Sub phát tín hiệu real-time khi có snapshot mới.
-- Đóng vai trò **điểm trung gian phi trạng thái duy nhất** kết nối Stream Processor và Dashboard.
-
----
-
-## TẦNG 5 — Live Operations Dashboard (Streamlit & PyDeck)
-
-**Files:** `dashboard/app.py` · `dashboard/data_loader.py` · `dashboard/config.py`
-
-Dashboard tự động làm mới (`st_autorefresh` mỗi 1–2 giây) lấy dữ liệu từ Redis, hiển thị trên giao diện Dark Enterprise Cyberpunk gồm **3 Tabs chuyên sâu**:
-
-### 1. 🗺️ Tab 1: 3D Fleet Command Map
-- **Bản đồ 3D PyDeck tương tác**:
-  - **Fleet Pins**: 300+ vị trí xe thời gian thực với màu sắc chuẩn TLC (🟡 Yellow `#FACC15`, 🟢 Green `#22C55E`, 🟣 FHVHV `#A855F7`) hoặc chế độ màu theo dải tốc độ (Fluid / Normal / Congestion).
-  - **Pickup Demand Heatmap**: Bản đồ nhiệt mật độ đón khách với thanh trượt tùy chỉnh bán kính (`radius`) và cường độ sáng (`intensity`).
-  - **#1 Busiest Zone Radar**: Radar hào quang neon phát sáng đánh dấu vùng tập trung đông xe nhất.
-  - **Airport Hubs Radar**: Beacon định vị nổi bật tại 3 sân bay quốc tế (JFK, LGA, EWR).
-- **Theo dõi xe đơn lẻ & HUD Chỉ Huy (Interactive Driver Focus)**:
-  - Tích hợp **OSRM Driving Route Engine**: Lộ trình đường phố thực tế chia 2 nhánh màu (Đoạn đã đi: Cyan neon `#00F5FF`, Đoạn sắp tới: Crimson neon `#F43F5E`).
-  - Phân tích hiệu suất tuyến đường (**Route Efficiency & Detour Score**): Phân loại `OPTIMAL` (≥90%), `MODERATE DETOUR` (75–89%), `HIGH DETOUR` (<75%).
-- **Fleet Dispatch Panel**: Tìm kiếm xe theo Trip ID/Borough, phân trang mượt mà (6 xe/trang), nút bấm chuyển focus camera trực tiếp đến xe.
-
-### 2. 📈 Tab 2: Live Stream Telemetry & Trends
-- **Top Operations Banner & 4 Thẻ KPI**: Active Fleet (3 loại xe), Doanh thu In-Flight ($/trip), Kafka Stream Events, Top Hotspot.
-- **4 Biểu đồ phân tích sóng thời gian thực (Plotly Dark)**:
-  1. *Kafka Stream Ingestion Velocity*: Tốc độ nạp sự kiện vi mô (Events / Sec Pulse Spline).
-  2. *Active Fleet Concentration by Top Pickup Zones*: Biểu đồ thanh ngang Top 8 điểm đón xe đông nhất.
-  3. *Borough Fleet Market Share Distribution*: Biểu đồ Donut tỷ trọng quận huyện chuẩn mực (nhãn nằm ngang, tự căn chỉnh khoảng cách, không chồng đè Legend).
-  4. *Real-Time Revenue Velocity*: Biểu đồ diện tích kép đo xung dòng tiền cước và phụ phí ($/giây).
-- **Live Micro-Batch Stream Feed**: Bảng feed vi mô thời gian thực với các nhãn trạng thái động (`EXPRESS_SPEED`, `HEAVY_TRAFFIC`, `ARRIVING_SOON`, `CRUISING`).
-
-### 3. ⚔️ Tab 3: Fleet Power Map
-- **Thanh kiểm soát lãnh thổ (Territory Control Bar)**: Tỷ lệ % số zone mà Yellow, Green, FHVHV đang chiếm ưu thế tuyệt đối.
-- **Bản đồ 3D Quyền Lực (PyDeck Power Map)**:
-  - 265 Taxi Zones được tô màu theo đội xe thống trị (`dominant_fleet`), kích thước bán kính tỉ lệ thuận với lượng xe.
-  - Vòng tròn đỏ phát xung cảnh báo tại các khu vực đang xảy ra **Invasion Alert** ($Z > 2.0\sigma$).
-  - Vùng tranh chấp màu vàng neon (**Contested Zones**).
-- **Live Invasion Feed & Battleground Hotspots**: Bảng theo dõi chi tiết các cuộc xâm lấn thị phần và vùng cạnh tranh khốc liệt nhất.
-
----
-
-## Sơ Đồ Kiến Trúc Luồng Tổng Thể
-
-```
-[ Parquet TLC / Synthetic Generator ]
-                 │
-                 ▼  JSON Telemetry (20–100 events/sec)
-        ┌──────────────────┐
-        │  Apache Kafka    │  Topic: taxi.trips.live (3 Partitions)
-        └────────┬─────────┘
-                 │ Consume (auto_offset_reset=latest)
-                 ▼
-        ┌────────────────────────────────────────────────────────┐
-        │        Apache Flink / Streaming Processor              │
-        │  ├── Sliding Window 60s (_vehicles state)              │
-        │  ├── Zone Density & Congestion Classifier (265 Zones)  │
-        │  └── ZonePowerTracker (Gaussian Welford Z-Score)       │
-        └────────────────────────┬───────────────────────────────┘
-                                 │ Pipeline SET / PUBLISH (2s Tick)
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                TẦNG 1: INGESTION & SIMULATOR                           │
+│  ┌────────────────────────┐        ┌────────────────────────┐                          │
+│  │ TLC Parquet Replay     │        │ Synthetic Generator    │                          │
+│  │ (Yellow, Green, FHVHV) │        │ (Zone-weighted Spawner)│                          │
+│  └───────────┬────────────┘        └───────────┬────────────┘                          │
+│              └─────────────────┬───────────────┘                                       │
+│                                ▼                                                       │
+│                 [ asyncio.Queue (Buffer: 2000) ]                                       │
+│                                │                                                       │
+│                 [ AIOKafkaProducer (Batch: 50) ]                                       │
+└────────────────────────────────┼───────────────────────────────────────────────────────┘
+                                 │ JSON Telemetry Stream (50–100+ events/sec)
                                  ▼
-        ┌────────────────────────────────────────────────────────┐
-        │              Redis 7.2 In-Memory Store                 │
-        │  ├── kv:latest_density_metrics                         │
-        │  ├── kv:power_map_snapshot (TTL 10s)                   │
-        │  └── hash:realtime_kpis                                │
-        └────────────────────────┬───────────────────────────────┘
-                                 │ Polling GET / HGETALL (1–2s)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                           TẦNG 2: MESSAGE BROKER (APACHE KAFKA)                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Topic: taxi.trips.live  |  6 Partitions  |  KRaft Mode (3.8.0)  |  Retention: 1h  │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────┼───────────────────────────────────────────────────────┘
+                                 │ Consumer Group: taxi-flink-group-<ts> (auto_offset=latest)
                                  ▼
-        ┌────────────────────────────────────────────────────────┐
-        │        Streamlit Live Operations Dashboard             │
-        │  ├── Tab 1: 🗺️ 3D Fleet Command Map (PyDeck + OSRM)    │
-        │  ├── Tab 2: 📈 Live Stream Telemetry & Trends (Plotly) │
-        │  └── Tab 3: ⚔️ Fleet Power Map (Territory Dominance)   │
-        └────────────────────────┬───────────────────────────────┘
-                                 │
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        TẦNG 3: STREAM PROCESSING ENGINE (APACHE FLINK)                 │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ FlinkStreamEngine (Python Streaming Processor)                                   │  │
+│  │  ├── In-Memory Sliding Window (60s State Window, Stale Eviction)                 │  │
+│  │  ├── Zone Congestion Classifier (265 Zones: LOW / MODERATE / HEAVY / CRITICAL)   │  │
+│  │  ├── Fleet Power & Dominance Engine (Territory Ratios & Battleground Status)     │  │
+│  │  └── Snapshot Aggregator (Micro-batch Trigger: 2.0s Interval)                    │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────┼───────────────────────────────────────────────────────┘
+                                 │ Redis Pipeline Write (SET / PUBLISH / HSET)
                                  ▼
-                      Web Browser (Port 8501)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        TẦNG 4: IN-MEMORY STATE & PUB/SUB STORE (REDIS 7.2)             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  • kv:latest_density_metrics   → JSON Snapshot 265 zones + active vehicles list  │  │
+│  │  • kv:power_map_snapshot       → Territory dominance & invasion zones (TTL 10s)  │  │
+│  │  • hash:realtime_kpis          → Operational counters & engine metadata           │  │
+│  │  • channel:density_metrics     → Pub/Sub real-time broadcast channel              │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────┼───────────────────────────────────────────────────────┘
+                                 │ Polling Query / In-Memory Cache (1–2s Interval)
+                                 ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                      TẦNG 5: LIVE OPERATIONS DASHBOARD (STREAMLIT + PYDECK)            │
+│  ┌─────────────────────────┬──────────────────────────┬─────────────────────────────┐  │
+│  │ Tab 1: 3D Fleet Map     │ Tab 2: Stream Telemetry  │ Tab 3: Fleet Power Map      │  │
+│  │ • PyDeck 3D Pin Layers  │ • Ingestion Pulse Chart  │ • Territory Control Bar     │  │
+│  │ • Pickup Demand Heatmap │ • Top Hotspots Ranking   │ • Dominance Bubble Map      │  │
+│  │ • Busiest / Hub Radars  │ • Borough Donut Share    │ • Contested Battlegrounds   │  │
+│  │ • OSRM Street Router    │ • Revenue Velocity Area  │ • Live Invasion Alert Feed  │  │
+│  │ • Focus Driver HUD      │ • Micro-Batch Event Feed │                             │  │
+│  └─────────────────────────┴──────────────────────────┴─────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Bảng Tóm Tắt Đặc Tả Kỹ Thuật
+## 🏗️ Chi Tiết 5 Tầng Xử Lý (5-Stage Pipeline Details)
 
-| Thành phần | Cơ chế hoạt động | Đặc tả chi tiết |
-|------------|------------------|-----------------|
-| **Power Map Welford** | Thống kê Online $O(1)$ | Theo dõi dominance ratio của 3 đội xe tại từng zone; $Z > 1.6\sigma$ hoặc $2.0\sigma$ kích hoạt Invasion Alert |
-| **Đệm Kafka** | KRaft 3 Partitions | Tách biệt hoàn toàn tốc độ nạp (20–100 evt/s) và chu kỳ render giao diện (2s) |
-| **Quản lý Stale State** | Time-based Eviction | Tự động loại bỏ xe không có ping trong 60s để tránh hiện tượng "xe ma" |
-| **Power Map Snapshot TTL** | In-Memory Expiration | `kv:power_map_snapshot` có TTL 10s, tự động làm sạch trạng thái khi luồng dừng |
-| **OSRM Street Routing** | Highway Network Graph | Truy vấn OSRM API cho lộ trình bám sát mạng lưới đường phố NYC; fallback Manhattan Grid khi timeout |
+### 📌 TẦNG 1 — Simulator & Data Ingestion
+- **Mã nguồn:** [`simulator/main.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/main.py) · [`simulator/generator/`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/generator) · [`simulator/loaders/`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/loaders) · [`simulator/models/`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/models) · [`simulator/producer/`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/producer) · [`simulator/zones/`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/zones)
+- **Đặc điểm vận hành**:
+  1. **Hỗ trợ 3 phân lớp Taxi NYC TLC**:
+     - 🟡 **Yellow Taxi (`YELLOW`)**: Taxi truyền thống tập trung tại Manhattan & sân bay (ID: `yt-*`). Trọng số mặc định: **40%**.
+     - 🟢 **Green Taxi (`GREEN`)**: Boro Taxi phục vụ Outer Boroughs & Upper Manhattan (ID: `gt-*`). Trọng số mặc định: **10%**.
+     - 🟣 **FHVHV (`FHVHV`)**: High-Volume For-Hire Vehicles (Uber / Lyft) phủ khắp 5 quận (ID: `hv-*`). Trọng số mặc định: **50%**.
+  2. **2 Cơ chế nạp dữ liệu (`SOURCE_MODE`)**:
+     - `PARQUET_REPLAY`: Nạp trực tiếp từ file Parquet tháng 04/2026 với 19 cột canonical chuẩn TLC (`yellow_tripdata_2026-04.parquet`, `green_tripdata_2026-04.parquet`, `fhvhv_tripdata_2026-04.parquet`).
+     - `SYNTHETIC_STREAM`: Sinh hành trình ngẫu nhiên dựa trên trọng số phân bố 265 Taxi Zones và mô hình toán học vận tốc theo giờ.
+  3. **Kiến trúc Producer bất đồng bộ (Dual-Task Async Architecture)**:
+     - **Task A (`_event_generator`)**: Khởi tạo chuyến xe mới hoặc tính toán bước nhảy tọa độ (interpolation) cho xe đang chạy, đẩy vào `asyncio.Queue` (buffer max 2000).
+     - **Task B (`_batch_sender`)**: Hút dữ liệu từ hàng đợi theo lô (`BATCH_SIZE=50`) và gửi fire-and-forget qua `aiokafka.AIOKafkaProducer`.
+  4. **Vòng đời sự kiện (3-State Lifecycle)**:
+     $$\text{TRIP\_STARTED (progress=0.0)} \longrightarrow \text{LOCATION\_PING (0.0 < progress < 1.0)} \longrightarrow \text{TRIP\_COMPLETED (progress=1.0)}$$
+
+---
+
+### 📌 TẦNG 2 — Message Broker (Apache Kafka KRaft)
+- **Image:** `apache/kafka:3.8.0` (KRaft mode — không cần cụm Zookeeper riêng biệt).
+- **Topic chính:** `taxi.trips.live`
+- **Thông số cấu hình tối ưu:**
+  - **Partitions:** `6` (đảm bảo khả năng scale song song nhiều consumer instances).
+  - **Replication Factor:** `1` (môi trường single-node container).
+  - **Log Retention:** `3600000 ms` (1 giờ) / `512 MB` (ngăn tràn bộ nhớ đệm ổ cứng).
+  - **Compression:** `gzip` (giảm tải băng thông truyền mạng).
+  - **Init Hook:** Container `taxi-realtime-kafka-init` tự động kiểm tra broker sẵn sàng và khởi tạo topic với partition/retention tương ứng.
+
+---
+
+### 📌 TẦNG 3 — Stream Processing Engine (Apache Flink / Streaming Job)
+- **Mã nguồn:** [`flink_processor/flink_streaming_job.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/flink_processor/flink_streaming_job.py) · [`flink_processor/config.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/flink_processor/config.py)
+- **Các thành phần xử lý trọng tâm**:
+  1. **Sliding Time Window (60s State Window)**:
+     - Duy trì trạng thái vị trí, tốc độ, cước phí, tọa độ xuất phát/đích của từng `trip_id`.
+     - Cơ chế **Stale Eviction**: Tự động dọn dẹp các xe không có ping mới vượt quá `SLIDING_WINDOW_SECONDS` (60s) hoặc nhận event `DROP_OFF` / `progress_ratio >= 1.0`.
+  2. **Zone Density & Congestion Classifier (265 Zones)**:
+     - Phân loại mật độ ùn tắc thời gian thực trên từng Zone theo 4 cấp bậc:
+       - 🟢 `LOW`: $< 3$ xe
+       - 🟡 `MODERATE`: $3 \le \text{xe} \le 6$
+       - 🟠 `HEAVY`: $7 \le \text{xe} \le 11$
+       - 🔴 `CRITICAL_CONGESTION`: $\ge 12$ xe
+  3. **Fleet Territory Dominance & Power Map Algorithm**:
+     - Hàm `compute_zone_dominance()` phân tích tỷ trọng số lượng xe của 3 đội tại từng Zone:
+       - `dominant_fleet`: Đội xe chiếm số lượng cao nhất trong zone.
+       - `dominance_ratio`: Tỷ lệ chiếm hữu ($\frac{\text{Count}_{\text{dom}}}{\text{Total}}$).
+       - `battle_status`:
+         - `EMPTY`: 0 xe trong zone.
+         - `DOMINATED`: Đội dẫn đầu nắm giữ $\ge 50\%$ hoặc có khoảng cách áp đảo.
+         - `CONTESTED`: Top 2 đội xe chênh lệch $\le 1$ xe hoặc khoảng cách thị phần $< 20\%$.
+         - `BALANCED`: Phân bổ đồng đều giữa các đội xe.
+  4. **Micro-batch Redis Sink Trigger**:
+     - Định kỳ mỗi `DENSITY_PUBLISH_INTERVAL` (2.0s), engine tính toán toàn bộ snapshot và đẩy đồng bộ xuống Redis bằng `Pipeline`.
+
+---
+
+### 📌 TẦNG 4 — In-Memory State & Pub/Sub Store (Redis 7.2)
+- **Image:** `redis:7.2-alpine` (Cổng `6379`).
+- **Data Contract & Key Structure**:
+
+| Redis Key / Channel | Kiểu dữ liệu | TTL | Nội dung mô tả |
+|---------------------|--------------|-----|----------------|
+| `kv:latest_density_metrics` | String (JSON) | Không | Snapshot toàn bộ 265 zones, danh sách xe active (tọa độ, tốc độ, tiến trình), phân bố quận huyện và 3 đội xe. |
+| `kv:power_map_snapshot` | String (JSON) | **10s** | Danh sách các zone tranh chấp (`invasion_zones`) và số lượng zone mỗi đội xe nắm quyền (`territory_counts`). Tự hủy nếu pipeline ngừng hoạt động. |
+| `hash:realtime_kpis` | Hash | Không | Bộ đếm KPI vận hành: `total_active_vehicles`, `total_events_processed`, `last_density_update`, `engine`. |
+| `channel:density_metrics` | Pub/Sub Channel | N/A | Kênh broadcast snapshot theo chu kỳ 2s cho các client lắng nghe trực tiếp. |
+
+---
+
+### 📌 TẦNG 5 — Live Operations Dashboard (Streamlit & PyDeck 3D)
+- **Mã nguồn:** [`dashboard/app.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/dashboard/app.py) · [`dashboard/data_loader.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/dashboard/data_loader.py) · [`dashboard/config.py`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/dashboard/config.py)
+- **Giao diện Cyberpunk Dark Enterprise với 3 Không Gian Tác Chiến**:
+
+```text
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  🚕 NYC REAL-TIME TAXI TELEMETRY COMMAND CENTER                                │
+│  [ Active Fleet: 500 ] [ In-Flight Fare: $8,450 ] [ Ingested: 120,400 evts ]   │
+├────────────────────────────────────────────────────────────────────────────────┤
+│  [ Tab 1: 🗺️ 3D Fleet Command Map ]                                            │
+│  • PyDeck 3D Scatterplot Pin Layer (Màu sắc chuẩn TLC / Dải màu tốc độ)        │
+│  • Hexagon & Heatmap Layer (Mật độ đón khách với thanh trượt radius/intensity) │
+│  • Radar Beacons (Phát xung neon tại #1 Busiest Zone & 3 Sân bay JFK/LGA/EWR)  │
+│  • OSRM Street Router: Vẽ tuyến đường đi thực tế qua mạng lưới phố NYC         │
+│  • Driver Focus HUD & Detour Efficiency Score (OPTIMAL / MODERATE / HIGH)      │
+│  • Paginated Fleet Dispatch Drawer (6 xe/trang, tra cứu theo ID/Borough)       │
+├────────────────────────────────────────────────────────────────────────────────┤
+│  [ Tab 2: 📈 Live Stream Telemetry & Trends ]                                  │
+│  • 4 Khối biểu đồ Plotly Dark:                                                 │
+│    1. Ingestion Velocity Spline (Events/sec theo thời gian thực)               │
+│    2. Top 8 Pickup Hotspots Bar Chart (Điểm đón xe nhộn nhịp nhất)             │
+│    3. Borough Market Share Donut Chart (Tỷ trọng phân bổ 5 quận)               │
+│    4. Revenue Velocity Area Chart ($/sec dòng tiền cước và phụ phí)            │
+│  • Live Micro-Batch Stream Feed (Bảng chi tiết gắn nhãn động telemetry)        │
+├────────────────────────────────────────────────────────────────────────────────┤
+│  [ Tab 3: ⚔️ Fleet Power Map ]                                                 │
+│  • Territory Dominance Bar (% số Zone mỗi đội Yellow/Green/FHVHV thống trị)    │
+│  • PyDeck 3D Dominance Bubble Map (Bán kính tỉ lệ với số xe, màu theo đội)     │
+│  • Radar phát xung cảnh báo tại các khu vực tranh chấp (Contested Zones)       │
+│  • Battleground Hotspots Table & Live Invasion Feed                            │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📋 Đặc Tả Schema Dữ Liệu Sự Kiện (Canonical Event Schema)
+
+Mỗi thông điệp truyền trên topic Kafka `taxi.trips.live` tuân thủ nghiêm ngặt Pydantic Model [`TripEvent`](file:///run/media/pch1101/PCH/Build/DE/taxi_real_time/simulator/models/trip_event.py):
+
+```json
+{
+  "trip_id": "yt-202604-000142",
+  "dataset_source": "YELLOW",
+  "event_type": "LOCATION_PING",
+  "pickup_datetime": "2026-04-12T14:30:00",
+  "dropoff_datetime": "2026-04-12T14:48:00",
+  "PULocationID": 237,
+  "DOLocationID": 161,
+  "pickup_zone_name": "Upper East Side South",
+  "pickup_borough": "Manhattan",
+  "dropoff_zone_name": "Midtown Center",
+  "dropoff_borough": "Manhattan",
+  "current_lat": 40.7682,
+  "current_lng": -73.9621,
+  "passenger_count": 1,
+  "trip_distance": 2.45,
+  "total_amount": 16.50,
+  "progress_ratio": 0.42,
+  "timestamp": 1776004245.12,
+  "datetime_utc": "2026-04-12T18:30:45.120000+00:00"
+}
+```
+
+---
+
+## ⚡ Chỉ Số Hiệu Năng & Độ Trễ (Performance Benchmarks)
+
+| Hạng mục | Thông số cam kết | Cơ chế kỹ thuật đảm bảo |
+|----------|-------------------|--------------------------|
+| **Tốc độ sinh sự kiện (Simulator)** | $50 - 100+$ events/sec | `asyncio.Queue` + `aiokafka` Fire-and-forget Batching |
+| **Độ trễ truyền Kafka (Broker Latency)** | $< 5\text{ ms}$ | Kafka 3.8.0 KRaft mode nội bộ Docker Network |
+| **Chu kỳ xử lý Stream (Flink Window)** | $2.0\text{ s}$ Tick | Sliding Memory Window $60\text{s}$ + Redis Pipeline Write |
+| **Độ trễ cập nhật Dashboard (UI Refresh)** | $1 - 2\text{ s}$ | `st_autorefresh` + In-memory Redis Cache Query |
+| **Thời gian dọn dẹp trạng thái Stale** | $60\text{ s}$ timeout / $10\text{ s}$ TTL | Tự động loại bỏ xe mất tín hiệu và snapshot hết hạn |

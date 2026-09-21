@@ -16,57 +16,111 @@ from streamlit_autorefresh import st_autorefresh
 from config import config
 from data_loader import data_loader
 
-@st.cache_data(ttl=86400, max_entries=1000, show_spinner=False)
+def _fallback_nyc_corridor_route(s_lng: float, s_lat: float, t_lng: float, t_lat: float) -> list:
+    """Generate realistic land/bridge corridor waypoints to avoid straight lines cutting across rivers/bays."""
+    def _guess_borough(lng: float, lat: float) -> str:
+        if lng < -74.05:
+            return "Staten Island"
+        if lat >= 40.795 and lng > -73.93:
+            return "Bronx"
+        if lng > -73.93:
+            return "Queens" if lat >= 40.70 else "Brooklyn"
+        if -74.025 <= lng <= -73.925 and 40.70 <= lat <= 40.88:
+            return "Manhattan"
+        return "Brooklyn"
+
+    pu_b = _guess_borough(s_lng, s_lat)
+    do_b = _guess_borough(t_lng, t_lat)
+    avg_lat = (s_lat + t_lat) / 2.0
+
+    pts: list = [[s_lng, s_lat]]
+
+    if ("Staten Island" in (pu_b, do_b)) and (pu_b != do_b):
+        # Route via Verrazzano-Narrows Bridge & I-278 expressway corridor
+        if pu_b == "Staten Island":
+            pts.extend([[-74.1200, 40.6120], [-74.0447, 40.6066], [-74.0150, 40.6450]])
+        else:
+            pts.extend([[-74.0150, 40.6450], [-74.0447, 40.6066], [-74.1200, 40.6120]])
+
+    elif ("Manhattan" in (pu_b, do_b)) and ("Brooklyn" in (pu_b, do_b)):
+        if avg_lat <= 40.715:
+            pts.append([-73.9930, 40.7070])  # Brooklyn / Manhattan Bridge
+        elif avg_lat <= 40.735:
+            pts.append([-73.9723, 40.7135])  # Williamsburg Bridge
+        else:
+            pts.extend([[-73.9542, 40.7570], [-73.9535, 40.7380]])  # Queensboro + Pulaski
+
+    elif ("Manhattan" in (pu_b, do_b)) and ("Queens" in (pu_b, do_b)):
+        if avg_lat < 40.750:
+            pts.append([-73.9635, 40.7445])  # Queens-Midtown Tunnel
+        elif avg_lat < 40.780:
+            pts.append([-73.9542, 40.7570])  # Queensboro Bridge
+        else:
+            pts.append([-73.9240, 40.7760])  # RFK / Triborough Bridge
+
+    elif ("Manhattan" in (pu_b, do_b)) and ("Bronx" in (pu_b, do_b)):
+        pts.append([-73.9315, 40.8105])  # 3rd Ave / Willis Bridge
+
+    elif ("Queens" in (pu_b, do_b)) and ("Bronx" in (pu_b, do_b)):
+        pts.append([-73.8300, 40.8035])  # Bronx-Whitestone Bridge
+
+    elif pu_b == "Manhattan" and do_b == "Manhattan":
+        # Manhattan grid avenue turn
+        mid_lat = (s_lat + t_lat) * 0.5
+        mid_lng = max(-74.015, min(-73.935, (s_lng + t_lng) * 0.5))
+        pts.append([mid_lng, mid_lat])
+
+    pts.append([t_lng, t_lat])
+    return pts
+
+
+@st.cache_data(ttl=86400, max_entries=2000, show_spinner=False)
 def fetch_driving_route(start_lng: float, start_lat: float, target_lng: float, target_lat: float) -> dict:
-    """Ultra-fast routing with Manhattan street-grid waypoints and non-blocking OSRM lookup."""
-    s_lng, s_lat = round(float(start_lng), 4), round(float(start_lat), 4)
-    t_lng, t_lat = round(float(target_lng), 4), round(float(target_lat), 4)
+    """Ultra-fast driving route adhering strictly to real NYC street & bridge geometry with OSRM & smart fallback."""
+    s_lng, s_lat = round(float(start_lng), 5), round(float(start_lat), 5)
+    t_lng, t_lat = round(float(target_lng), 5), round(float(target_lat), 5)
 
     if abs(s_lng - t_lng) < 0.0001 and abs(s_lat - t_lat) < 0.0001:
         return {
             "coordinates": [[s_lng, s_lat], [t_lng, t_lat]],
             "optimal_distance_miles": 0.5,
-            "est_duration_min": 1.0
+            "est_duration_min": 1.0,
         }
 
-    try:
-        url = f"https://router.project-osrm.org/route/v1/driving/{s_lng:.4f},{s_lat:.4f};{t_lng:.4f},{t_lat:.4f}?overview=full&geometries=geojson"
-        req = urllib.request.Request(url, headers={"User-Agent": "NYCTaxiTelemetry/1.0"})
-        with urllib.request.urlopen(req, timeout=0.35) as response:
-            if response.status == 200:
-                res_data = json.loads(response.read().decode())
-                if res_data.get("code") == "Ok" and res_data.get("routes"):
-                    r0 = res_data["routes"][0]
-                    coords = r0["geometry"]["coordinates"]
-                    if len(coords) >= 2:
-                        opt_miles = round(r0.get("distance", 0) / 1609.34, 2)
-                        dur_min = round(r0.get("duration", 0) / 60.0, 1)
-                        return {
-                            "coordinates": coords,
-                            "optimal_distance_miles": opt_miles,
-                            "est_duration_min": dur_min
-                        }
-    except Exception:
-        pass
+    endpoints = [
+        f"https://routing.openstreetmap.de/routed-car/route/v1/driving/{s_lng:.5f},{s_lat:.5f};{t_lng:.5f},{t_lat:.5f}?overview=full&geometries=geojson",
+        f"https://router.project-osrm.org/route/v1/driving/{s_lng:.5f},{s_lat:.5f};{t_lng:.5f},{t_lat:.5f}?overview=full&geometries=geojson",
+    ]
 
-    # Instant realistic Manhattan street-grid polyline
-    mid1_lng = s_lng
-    mid1_lat = s_lat + (t_lat - s_lat) * 0.45
-    mid2_lng = t_lng
-    mid2_lat = mid1_lat
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "NYCTaxiTelemetry/1.0"})
+            with urllib.request.urlopen(req, timeout=2.0) as response:
+                if response.status == 200:
+                    res_data = json.loads(response.read().decode())
+                    if res_data.get("code") == "Ok" and res_data.get("routes"):
+                        r0 = res_data["routes"][0]
+                        coords = r0["geometry"]["coordinates"]
+                        if len(coords) >= 2:
+                            opt_miles = round(r0.get("distance", 0) / 1609.34, 2)
+                            dur_min = round(r0.get("duration", 0) / 60.0, 1)
+                            return {
+                                "coordinates": coords,
+                                "optimal_distance_miles": opt_miles,
+                                "est_duration_min": dur_min,
+                            }
+        except Exception:
+            continue
 
+    # Fallback to bridge-aware NYC highway & corridor polyline
+    corridor_pts = _fallback_nyc_corridor_route(s_lng, s_lat, t_lng, t_lat)
     dlat = abs(t_lat - s_lat) * 69.0
     dlng = abs(t_lng - s_lng) * 52.0
     approx_miles = max(0.5, round(dlat + dlng, 2))
     return {
-        "coordinates": [
-            [s_lng, s_lat],
-            [mid1_lng, mid1_lat],
-            [mid2_lng, mid2_lat],
-            [t_lng, t_lat]
-        ],
+        "coordinates": corridor_pts,
         "optimal_distance_miles": approx_miles,
-        "est_duration_min": round(approx_miles / 18.0 * 60, 1)
+        "est_duration_min": round(approx_miles / 18.0 * 60, 1),
     }
 
 def get_column_series(df: pd.DataFrame, col: str, default: Any = "") -> pd.Series:
@@ -1626,45 +1680,64 @@ with tab2:
             st.info("Accumulating borough distribution data...")
 
     with chart_col6:
-        # Dual Area / Multi-Line Waveform: Real-Time Revenue & Financial Velocity ($/Sec)
-        if has_hist and ("fare_velocity_history" in hist) and len(hist["fare_velocity_history"]) > 0:
-            fig_rev = go.Figure()
-            # Fares Velocity Stream Waveform
-            fig_rev.add_trace(go.Scatter(
-                x=hist["timestamps"],
-                y=hist.get("fare_velocity_history", []),
-                name="Fare Velocity ($/s)",
-                mode="lines+markers",
-                line=dict(color="#38BDF8", width=3, shape="spline"),
-                fill="tozeroy",
-                fillcolor="rgba(56, 189, 248, 0.18)",
-                marker=dict(size=4, color="#38BDF8"),
-                hovertemplate="<b>Fare Velocity:</b> $%{y:,.1f}/sec<extra></extra>"
-            ))
-            # Tips & Surcharges Velocity Stream Waveform
-            fig_rev.add_trace(go.Scatter(
-                x=hist["timestamps"],
-                y=hist.get("tips_velocity_history", []),
-                name="Tips & Fees ($/s)",
-                mode="lines+markers",
-                line=dict(color="#F59E0B", width=2.5, shape="spline"),
-                fill="tozeroy",
-                fillcolor="rgba(245, 158, 11, 0.12)",
-                marker=dict(size=4, color="#F59E0B"),
-                hovertemplate="<b>Tips & Fees:</b> $%{y:,.1f}/sec<extra></extra>"
-            ))
-            fig_rev.update_layout(
-                title="<b>💰 Real-Time Revenue Velocity ($/Sec Pulse Waveform)</b>",
+        # In-Flight Fare Distribution Histogram
+        if not df_v_stream.empty and "fare_amount" in df_v_stream.columns:
+            df_hist = df_v_stream.copy()
+            df_hist["fare_amount"] = get_numeric_series(df_hist, "fare_amount", 0.0)
+            df_hist["dataset_source"] = get_column_series(df_hist, "dataset_source", "YELLOW").astype(str).str.upper()
+            
+            type_label_map = {"YELLOW": "🚖 Yellow Cab", "GREEN": "🚕 Green Cab", "FHVHV": "📱 FHVHV"}
+            type_colors = {"YELLOW": "#FACC15", "GREEN": "#22C55E", "FHVHV": "#A855F7"}
+            
+            fig_fare_dist = go.Figure()
+            for ds in ["YELLOW", "FHVHV", "GREEN"]:
+                ds_data = df_hist[df_hist["dataset_source"] == ds]
+                if not ds_data.empty:
+                    fig_fare_dist.add_trace(go.Histogram(
+                        x=ds_data["fare_amount"],
+                        name=type_label_map.get(ds, ds),
+                        marker=dict(
+                            color=type_colors.get(ds, "#38BDF8"),
+                            line=dict(color="#0F172A", width=1)
+                        ),
+                        opacity=0.85,
+                        xbins=dict(size=5.0),
+                        hovertemplate="<b>%{data.name}</b><br>Fare: $%{x:.1f}<br>Trips: <b>%{y}</b><extra></extra>"
+                    ))
+
+            avg_fare = df_hist["fare_amount"].mean()
+
+            fig_fare_dist.update_layout(
+                title=f"<b>📊 In-Flight Fare Distribution ({selected_borough})</b>",
                 template="plotly_dark",
                 height=320,
+                barmode="stack",
                 margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                yaxis=dict(title="Velocity ($ / Sec)", tickprefix="$", gridcolor="rgba(255,255,255,0.06)", zeroline=False),
-                xaxis=dict(gridcolor="rgba(255,255,255,0.06)", showgrid=True, nticks=6, tickangle=0)
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10, family="Plus Jakarta Sans, sans-serif")),
+                xaxis=dict(
+                    title="In-Flight Fare Amount ($)",
+                    tickprefix="$",
+                    gridcolor="rgba(255,255,255,0.06)",
+                    zeroline=False
+                ),
+                yaxis=dict(
+                    title="Active Trip Count",
+                    gridcolor="rgba(255,255,255,0.06)",
+                    zeroline=False
+                ),
             )
-            st.plotly_chart(fig_rev, use_container_width=True, config={'displayModeBar': False})
+            if pd.notnull(avg_fare) and avg_fare > 0:
+                fig_fare_dist.add_vline(
+                    x=avg_fare,
+                    line_dash="dash",
+                    line_color="#38BDF8",
+                    annotation_text=f"Avg: ${avg_fare:.1f}",
+                    annotation_position="top right",
+                    annotation_font=dict(size=10, color="#38BDF8", family="JetBrains Mono, sans-serif")
+                )
+            st.plotly_chart(fig_fare_dist, use_container_width=True, config={'displayModeBar': False})
         else:
-            st.info("Accumulating live financial velocity & revenue telemetry...")
+            st.info(f"Accumulating live in-flight fare distribution for {selected_borough}...")
 
     # ── ROW 4: Live Micro-Batch Stream Ingestion Feed ──
     st.markdown("---")
@@ -1705,13 +1778,12 @@ with tab2:
         df_feed = df_feed.sort_values(by=["fare_amount", "speed_mph"], ascending=[False, False]).head(20)
 
         st.dataframe(
-            df_feed[["trip_id", "taxi_type", "corridor", "borough", "speed_mph", "fare_amount", "progress_ratio", "live_status"]],
+            df_feed[["trip_id", "taxi_type", "corridor", "borough", "fare_amount", "progress_ratio", "live_status"]],
             column_config={
                 "trip_id": st.column_config.TextColumn("Trip ID"),
                 "taxi_type": st.column_config.TextColumn("🚖 Fleet Type"),
                 "corridor": st.column_config.TextColumn("📍 Route Corridor (Pickup ➔ Dropoff)"),
                 "borough": st.column_config.TextColumn("Borough"),
-                "speed_mph": st.column_config.NumberColumn("⚡ Speed", format="%.1f mph"),
                 "fare_amount": st.column_config.NumberColumn("💵 In-Flight Fare", format="$%.2f"),
                 "progress_ratio": st.column_config.ProgressColumn("🎯 Trip Progress", format="%.0f%%", min_value=0.0, max_value=1.0),
                 "live_status": st.column_config.TextColumn("📡 Dynamic Status"),
@@ -2135,10 +2207,9 @@ with tab4:
         total_v = max(1, y_cnt + g_cnt + h_cnt)
         total_f = max(1, sum(s.get("total_fare", 0) for s in fleet_stats.values()))
         return (
-            (_fleet_counts_t4.get(fk, 0) / total_v)              * 40
-            + (fs.get("total_fare", 0) / total_f)                 * 30
-            + min(fs.get("avg_speed", 0) / 40.0, 1.0)            * 20
-            + (_fleet_zone_pct_t4.get(fk, 0) / 100.0)            * 10
+            (_fleet_counts_t4.get(fk, 0) / total_v)              * 50
+            + (fs.get("total_fare", 0) / total_f)                 * 35
+            + (_fleet_zone_pct_t4.get(fk, 0) / 100.0)            * 15
         )
 
     _ranked = sorted(_FLEET_KEYS, key=_t4_composite, reverse=True)
@@ -2158,16 +2229,8 @@ with tab4:
                     <span class="fa-metric-value" style="color:{_m['hex']};">{_fleet_counts_t4[_fk]:,}</span>
                   </div>
                   <div class="fa-metric-row">
-                    <span class="fa-metric-label">⚡ Avg Speed</span>
-                    <span class="fa-metric-value">{_fs.get('avg_speed', 0):.1f} mph</span>
-                  </div>
-                  <div class="fa-metric-row">
                     <span class="fa-metric-label">💰 Avg Fare</span>
                     <span class="fa-metric-value">${_fs.get('avg_fare', 0):.2f}</span>
-                  </div>
-                  <div class="fa-metric-row">
-                    <span class="fa-metric-label">💵 Avg Tip</span>
-                    <span class="fa-metric-value">${_fs.get('avg_tip', 0):.2f}</span>
                   </div>
                   <div class="fa-metric-row">
                     <span class="fa-metric-label">👥 Avg Passengers</span>
@@ -2296,28 +2359,27 @@ with tab4:
     with _radar_col:
         st.markdown('<div class="fa-section-header" style="margin-top:0;">🕸️ Multi-Metric Profile</div>', unsafe_allow_html=True)
 
-        _radar_dims = ["Fleet\nSize", "Avg\nSpeed", "Avg\nFare", "Zone\nControl", "Avg\nTip"]
+        _radar_dims = ["Fleet\nSize", "Total\nRev", "Avg\nFare", "Zone\nControl", "Avg\nPax"]
 
-        def _norm_list(vals: list) -> list:
-            mx = max(vals) if vals else 1
-            return [v / mx if mx else 0 for v in vals]
-
-        _r_vals_by_fleet = {
-            _fk: _norm_list([
-                _fleet_counts_t4.get(_fk, 0),
-                fleet_stats[_fk].get("avg_speed",  0),
-                fleet_stats[_fk].get("avg_fare",   0),
-                _fleet_zone_pct_t4.get(_fk, 0),
-                fleet_stats[_fk].get("avg_tip",    0),
-            ])
+        # Raw values per fleet across 5 comparative dimensions
+        _raw_vals_by_fleet = {
+            _fk: [
+                float(_fleet_counts_t4.get(_fk, 0)),
+                float(fleet_stats[_fk].get("total_fare", 0)),
+                float(fleet_stats[_fk].get("avg_fare",   0)),
+                float(_fleet_zone_pct_t4.get(_fk, 0)),
+                float(fleet_stats[_fk].get("avg_pax",    0)),
+            ]
             for _fk in _FLEET_KEYS
         }
-        # Normalise across fleets per dimension
-        for _di in range(5):
-            _dim_vals = [_r_vals_by_fleet[_fk][_di] for _fk in _FLEET_KEYS]
-            _mx = max(_dim_vals) or 1
+
+        # Normalize across fleets for EACH dimension independently (relative to max leader = 1.0)
+        _r_vals_by_fleet = {k: [] for k in _FLEET_KEYS}
+        for _di in range(len(_radar_dims)):
+            _col_vals = [_raw_vals_by_fleet[_fk][_di] for _fk in _FLEET_KEYS]
+            _mx = max(_col_vals) if max(_col_vals) > 0 else 1.0
             for _fk in _FLEET_KEYS:
-                _r_vals_by_fleet[_fk][_di] /= _mx
+                _r_vals_by_fleet[_fk].append(round(_raw_vals_by_fleet[_fk][_di] / _mx, 3))
 
         _radar_fig = go.Figure()
         for _fk in _FLEET_KEYS:
@@ -2354,53 +2416,107 @@ with tab4:
 
     st.markdown('<hr class="fa-section-divider">', unsafe_allow_html=True)
 
+    # ── SECTION D: Passenger Load Breakdown ────────────────────────────────
+    st.markdown('<div class="fa-section-header">👥 Passenger Load Breakdown &amp; Occupancy Profile</div>', unsafe_allow_html=True)
 
+    _pax_buckets = ["1 Pax (Solo)", "2 Pax (Duo)", "3–4 Pax (Group)", "5+ Pax (Family/Van)"]
+    _pax_counts_by_fleet: dict[str, list[int]] = {}
+    _pax_shares_by_fleet: dict[str, list[float]] = {}
 
-    # ── SECTION E: Speed Distribution Box Plot ────────────────────────────
-    st.markdown('<div class="fa-section-header">🚀 Speed Distribution by Fleet</div>', unsafe_allow_html=True)
-
-    _box_fig = go.Figure()
-    _has_box_data = False
     for _fk in _FLEET_KEYS:
-        _m       = _FA_META[_fk]
-        _hex     = _m["hex"]
-        _raw_spd = fleet_stats[_fk].get("speeds_raw", [])
-        if len(_raw_spd) >= 3:
-            _has_box_data = True
-            _rgba_fill = f"rgba({int(_hex[1:3],16)},{int(_hex[3:5],16)},{int(_hex[5:7],16)},0.18)"
-            _box_fig.add_trace(go.Box(
-                y=_raw_spd, name=f"{_m['icon']} {_m['name']}",
-                marker_color=_hex,
-                line=dict(color=_hex, width=2),
-                fillcolor=_rgba_fill,
-                boxmean="sd",
-                jitter=0.35, pointpos=-1.6, boxpoints="outliers",
-                marker=dict(size=3, opacity=0.5),
-                hovertemplate=f"<b>{_m['name']}</b><br>Speed: <b>%{{y:.1f}} mph</b><extra></extra>",
-            ))
-        else:
-            # Fallback: average bar when sample size < 3
-            _box_fig.add_trace(go.Bar(
-                x=[f"{_m['icon']} {_m['name']}"],
-                y=[fleet_stats[_fk].get("avg_speed", 0)],
-                marker_color=_hex, marker_opacity=0.8,
+        _vlist = _fleet_vehicles.get(_fk, [])
+        _p_list = [int(v.get("passenger_count", 1) or 1) for v in _vlist]
+        _b1 = sum(1 for p in _p_list if p <= 1)
+        _b2 = sum(1 for p in _p_list if p == 2)
+        _b3 = sum(1 for p in _p_list if 3 <= p <= 4)
+        _b4 = sum(1 for p in _p_list if p >= 5)
+        _counts = [_b1, _b2, _b3, _b4]
+        _tot_p = max(1, sum(_counts))
+        _pax_counts_by_fleet[_fk] = _counts
+        _pax_shares_by_fleet[_fk] = [round(c / _tot_p * 100, 1) for c in _counts]
+
+    _pax_col1, _pax_col2 = st.columns(2)
+
+    with _pax_col1:
+        st.markdown('<div style="font-size:0.85rem;font-weight:700;color:#94A3B8;margin-bottom:6px;">📊 Active Trips by Passenger Group</div>', unsafe_allow_html=True)
+        _pax_fig1 = go.Figure()
+        for _fk in _FLEET_KEYS:
+            _m = _FA_META[_fk]
+            _hex = _m["hex"]
+            _counts = _pax_counts_by_fleet[_fk]
+            _pax_fig1.add_trace(go.Bar(
                 name=f"{_m['icon']} {_m['name']}",
-                text=[f"{fleet_stats[_fk].get('avg_speed',0):.1f} mph"], textposition="auto",
-                textfont=dict(size=12, color="white"),
-                hovertemplate=f"<b>{_m['name']}</b><br>Avg Speed: <b>%{{y:.1f}} mph</b><extra></extra>",
+                x=_pax_buckets,
+                y=_counts,
+                marker=dict(color=_hex, opacity=0.88, line=dict(color="rgba(255,255,255,0.12)", width=1)),
+                text=[f"{c:,}" if c > 0 else "" for c in _counts],
+                textposition="auto",
+                textfont=dict(size=11, color="white", family="JetBrains Mono, monospace"),
+                hovertemplate=f"<b>{_m['name']}</b><br>%{{x}}: <b>%{{y:,}} trips</b><extra></extra>",
             ))
 
-    _box_fig.update_layout(
-        height=300,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.4)",
-        margin=dict(l=0, r=0, t=10, b=0),
-        font=dict(family="Inter, sans-serif", color="#E2E8F0"),
-        showlegend=False,
-        xaxis=dict(showgrid=False, tickfont=dict(size=12, color="#E2E8F0")),
-        yaxis=dict(
-            gridcolor="rgba(255,255,255,0.05)", tickfont=dict(size=9, color="#64748B"),
-            title=dict(text="Speed (mph)", font=dict(size=10, color="#64748B")),
-        ),
-        hovermode="closest",
-    )
-    st.plotly_chart(_box_fig, use_container_width=True)
+        _pax_fig1.update_layout(
+            barmode="group",
+            height=300,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.4)",
+            margin=dict(l=10, r=10, t=10, b=50),
+            font=dict(family="Inter, sans-serif", color="#E2E8F0"),
+            legend=dict(
+                orientation="h",
+                y=-0.22,
+                x=0.5,
+                xanchor="center",
+                font=dict(size=10, color="#CBD5E1"),
+                bgcolor="rgba(0,0,0,0)",
+            ),
+            xaxis=dict(showgrid=False, tickfont=dict(size=10, color="#CBD5E1")),
+            yaxis=dict(
+                gridcolor="rgba(255,255,255,0.05)",
+                tickfont=dict(size=9, color="#64748B"),
+                title=dict(text="Active Trips", font=dict(size=10, color="#64748B")),
+            ),
+        )
+        st.plotly_chart(_pax_fig1, use_container_width=True)
+
+    with _pax_col2:
+        st.markdown('<div style="font-size:0.85rem;font-weight:700;color:#94A3B8;margin-bottom:6px;">📈 Occupancy Mix Share (100% Normalized)</div>', unsafe_allow_html=True)
+        _pax_fig2 = go.Figure()
+        _tier_colors = ["#38BDF8", "#818CF8", "#F59E0B", "#EC4899"]
+        _fleet_display_names = [f"{_FA_META[k]['icon']} {_FA_META[k]['name']}" for k in _FLEET_KEYS]
+
+        for _ti, _tier_name in enumerate(_pax_buckets):
+            _tier_shares = [_pax_shares_by_fleet[k][_ti] for k in _FLEET_KEYS]
+            _tier_counts = [_pax_counts_by_fleet[k][_ti] for k in _FLEET_KEYS]
+            _pax_fig2.add_trace(go.Bar(
+                name=_tier_name,
+                y=_fleet_display_names,
+                x=_tier_shares,
+                orientation="h",
+                marker=dict(color=_tier_colors[_ti], opacity=0.88, line=dict(color="rgba(255,255,255,0.08)", width=1)),
+                text=[f"{s:.0f}%" if s >= 6 else "" for s in _tier_shares],
+                textposition="inside",
+                textfont=dict(size=10, color="white", family="JetBrains Mono, monospace"),
+                hovertemplate=f"<b>%{{y}}</b><br>{_tier_name}: <b>%{{x:.1f}}%</b> (%{{customdata:,}} trips)<extra></extra>",
+                customdata=_tier_counts,
+            ))
+
+        _pax_fig2.update_layout(
+            barmode="stack",
+            height=300,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.4)",
+            margin=dict(l=10, r=10, t=10, b=50),
+            font=dict(family="Inter, sans-serif", color="#E2E8F0"),
+            legend=dict(
+                orientation="h",
+                y=-0.22,
+                x=0.5,
+                xanchor="center",
+                font=dict(size=10, color="#CBD5E1"),
+                bgcolor="rgba(0,0,0,0)",
+            ),
+            xaxis=dict(gridcolor="rgba(255,255,255,0.05)", tickfont=dict(size=9, color="#64748B"), ticksuffix="%"),
+            yaxis=dict(showgrid=False, tickfont=dict(size=11, color="#E2E8F0")),
+        )
+        st.plotly_chart(_pax_fig2, use_container_width=True)
+
+
