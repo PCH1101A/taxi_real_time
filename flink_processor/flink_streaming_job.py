@@ -29,7 +29,7 @@ log = logging.getLogger("flink_job")
 _CRITICAL_THRESHOLD = 12
 _HEAVY_THRESHOLD = 7
 _MODERATE_THRESHOLD = 3
-_MAP_VEHICLE_LIMIT = 800
+_MAP_VEHICLE_LIMIT = 1000
 _TOP_ZONES_LIMIT = 10
 _DROPOFF_PROGRESS = 0.6
 _MIN_VEHICLES_FOR_DOMINANCE = 2
@@ -153,7 +153,7 @@ class FlinkStreamEngine:
         event_type = event.get("event_type", "IN_PROGRESS")
         progress = float(event.get("progress_ratio", 0.0))
 
-        if event_type == "DROP_OFF" or progress >= 1.0:
+        if event_type in ("DROP_OFF", "TRIP_COMPLETED") or progress >= 1.0:
             if trip_id in self._vehicles:
                 del self._vehicles[trip_id]
             return
@@ -176,7 +176,19 @@ class FlinkStreamEngine:
         dropoff_borough = do_info.get("borough") or event.get("dropoff_borough") or "Unknown"
 
         fare = float(event.get("fare_amount") or event.get("total_amount") or 0.0)
-        speed = float(event.get("speed_mph") or 15.0)
+        speed = float(event.get("speed_mph") or 0.0)
+        if speed <= 0.0:
+            base_by_boro = {
+                "Manhattan": 13.5,
+                "Brooklyn": 19.0,
+                "Queens": 23.5,
+                "Bronx": 20.0,
+                "Staten Island": 29.0,
+            }
+            base = base_by_boro.get(borough, 18.0)
+            hash_val = sum(ord(c) for c in trip_id)
+            variance = ((hash_val % 100) / 100.0 - 0.5) * 14.0
+            speed = max(6.5, base + variance)
         passengers = int(event.get("passenger_count") or 1)
 
         # Exact coordinates for 3D map rendering

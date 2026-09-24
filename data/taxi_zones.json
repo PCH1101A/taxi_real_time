@@ -13,7 +13,7 @@
     "borough": "Queens",
     "lat": 40.61079,
     "lng": -73.8225,
-    "base_demand": 1.5
+    "base_demand": 0.0
   },
   {
     "zone_id": 3,
@@ -821,7 +821,7 @@
     "borough": "Manhattan",
     "lat": 40.68982,
     "lng": -74.04515,
-    "base_demand": 2.0
+    "base_demand": 0.0
   },
   {
     "zone_id": 104,
@@ -829,7 +829,7 @@
     "borough": "Manhattan",
     "lat": 40.69867,
     "lng": -74.0407,
-    "base_demand": 2.0
+    "base_demand": 0.0
   },
   {
     "zone_id": 105,
@@ -837,7 +837,7 @@
     "borough": "Manhattan",
     "lat": 40.68813,
     "lng": -74.0192,
-    "base_demand": 2.0
+    "base_demand": 0.0
   },
   {
     "zone_id": 106,

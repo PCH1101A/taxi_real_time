@@ -87,10 +87,10 @@ services:
       - ENABLED_DATASETS=YELLOW,GREEN,FHVHV
       - DATA_DIR=/app/data
       - ZONE_JSON_PATH=/app/data/taxi_zones.json
-      - EVENTS_PER_SECOND=100.0
-      - BATCH_SIZE=50
-      - MAX_CONCURRENT_TRIPS=500
-      - QUEUE_MAX_SIZE=2000
+      - EVENTS_PER_SECOND=400.0
+      - BATCH_SIZE=100
+      - MAX_CONCURRENT_TRIPS=400
+      - QUEUE_MAX_SIZE=4000
       - YELLOW_WEIGHT=0.40
       - GREEN_WEIGHT=0.10
       - FHVHV_WEIGHT=0.50
@@ -100,6 +100,7 @@ services:
       - ANOMALY_RATE=0.08
     volumes:
       - ./data:/app/data:ro
+      - ./simulator:/app
     depends_on:
       kafka:
         condition: service_healthy
@@ -136,20 +137,16 @@ services:
     restart: unless-stopped
 
 
-  # ── 5. Live Dashboard: Streamlit Real-Time Monitor ────────────────────────────
-  dashboard:
+  # ── 5. Real-Time API Gateway (FastAPI + WebSockets) ─────────────────────────
+  api-gateway:
     build:
-      context: ./dashboard
+      context: ./api_gateway
       dockerfile: Dockerfile
-    container_name: taxi-realtime-dashboard
+    container_name: taxi-realtime-api
     ports:
-      - "8501:8501"
+      - "8080:8080"
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - REFRESH_INTERVAL_MS=2000
-    volumes:
-      - ./data:/app/data:ro
-      - ./dashboard:/app
     depends_on:
       redis:
         condition: service_healthy
@@ -157,8 +154,23 @@ services:
       - taxi_stream_net
     restart: unless-stopped
 
+  # ── 6. Mission Control Web SPA (Vite + React + Deck.gl + Nginx) ─────────────
+  web-dashboard:
+    build:
+      context: ./web_dashboard
+      dockerfile: Dockerfile
+    container_name: taxi-realtime-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-gateway
+    networks:
+      - taxi_stream_net
+    restart: unless-stopped
+
 networks:
   taxi_stream_net:
     driver: bridge
+
 
 

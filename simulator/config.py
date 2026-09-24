@@ -24,10 +24,10 @@ class SimulatorConfig(BaseSettings):
     ZONE_JSON_PATH: str = "/app/data/taxi_zones.json"
 
     # ── Throughput ────────────────────────────────────────────────────────────
-    EVENTS_PER_SECOND: float = 100.0       # target throughput
-    BATCH_SIZE: int = 50                   # events per Kafka batch
-    MAX_CONCURRENT_TRIPS: int = 500        # max in-flight simulated trips
-    QUEUE_MAX_SIZE: int = 2000             # internal async queue buffer
+    EVENTS_PER_SECOND: float = 400.0       # target throughput (300-500 range)
+    BATCH_SIZE: int = 100                  # events per Kafka batch
+    MAX_CONCURRENT_TRIPS: int = 400        # max in-flight simulated trips
+    QUEUE_MAX_SIZE: int = 4000             # internal async queue buffer
 
     # ── Dataset mix weights (PARQUET_REPLAY only) ─────────────────────────────
     # Proportion of new trips to start from each dataset. Must sum to ~1.0.

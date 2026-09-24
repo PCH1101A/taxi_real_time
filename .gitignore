@@ -97,3 +97,11 @@ temp/
 flink-checkpoints/
 checkpoints/
 .flink/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Kit
+*.agents/

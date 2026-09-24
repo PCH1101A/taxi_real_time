@@ -112,6 +112,17 @@ def generate_synthetic_trip(
 
     now = datetime.now(timezone.utc)
 
+    # Distance-scaled speed: longer trip distance travels much faster via highways
+    d_safe = max(0.2, dist)
+    base_speed = 9.0 + 49.0 * (1.0 - math.exp(-d_safe / 8.2))
+    if pu.zone_id in (132, 138, 1) or do.zone_id in (132, 138, 1):
+        base_speed *= 1.15
+    elif pu.borough == "Manhattan" and do.borough == "Manhattan" and d_safe < 4.0:
+        base_speed *= 0.85
+    elif pu.borough == "Staten Island" or do.borough == "Staten Island":
+        base_speed *= 1.10
+    speed_mph = round(max(7.5, min(65.0, base_speed * random.uniform(0.93, 1.07))), 1)
+
     return TripEvent(
         trip_id=prefix + uuid.uuid4().hex[:8],
         dataset_source=dataset_source,
@@ -129,6 +140,7 @@ def generate_synthetic_trip(
         passenger_count=passenger_count,
         trip_distance=dist,
         total_amount=max(0.0, total),
+        speed_mph=speed_mph,
         progress_ratio=0.0,
         timestamp=time.time(),
     )

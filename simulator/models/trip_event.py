@@ -45,6 +45,7 @@ class TripEvent(BaseModel):
     passenger_count: int = Field(default=1, ge=0, le=9)
     trip_distance: float = Field(ge=0.0)   # miles, already filtered
     total_amount: float = Field(ge=0.0)    # USD, already filtered
+    speed_mph: float = Field(default=15.0, ge=0.0)
 
     # ── Progress tracking (real-time lifecycle) ───────────────
     progress_ratio: float = Field(default=0.0, ge=0.0, le=1.0)

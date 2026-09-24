@@ -31,12 +31,15 @@ class Zone:
     base_demand: float
 
 
+NON_DRIVABLE_ZONE_IDS = {2, 103, 104, 105, 264, 265}
+
+
 class ZoneRegistry:
-    """Immutable registry of 263 NYC taxi zones, loaded once at startup."""
+    """Immutable registry of NYC taxi zones, filtering non-drivable water zones."""
 
     def __init__(self, json_path: Optional[str] = None) -> None:
         raw = self._load(json_path)
-        self._zones: List[Zone] = [
+        all_zones = [
             Zone(
                 zone_id=int(z["zone_id"]),
                 zone_name=z.get("zone_name", f"Zone {z['zone_id']}"),
@@ -47,9 +50,21 @@ class ZoneRegistry:
             )
             for z in raw
         ]
-        self._by_id: Dict[int, Zone] = {z.zone_id: z for z in self._zones}
-        self._weights: List[float] = [z.base_demand for z in self._zones]
-        log.info("ZoneRegistry loaded %d zones", len(self._zones))
+        self._by_id: Dict[int, Zone] = {z.zone_id: z for z in all_zones}
+        
+        # Drivable road zones only (exclude open water and car-free islands)
+        self._zones: List[Zone] = [
+            z for z in all_zones 
+            if z.zone_id not in NON_DRIVABLE_ZONE_IDS and z.base_demand > 0.0
+        ]
+        if not self._zones:
+            self._zones = all_zones
+        self._weights: List[float] = [max(0.1, z.base_demand) for z in self._zones]
+        log.info(
+            "ZoneRegistry loaded %d total zones (%d active drivable zones)",
+            len(all_zones),
+            len(self._zones),
+        )
 
     def _load(self, path: Optional[str]) -> list:
         candidates = [
@@ -73,6 +88,12 @@ class ZoneRegistry:
         return self._by_id.get(zone_id)
 
     def get_or_random(self, zone_id: int) -> Zone:
+        if zone_id in NON_DRIVABLE_ZONE_IDS:
+            if zone_id == 2:  # Jamaica Bay -> nearby JFK Airport
+                return self._by_id.get(132) or self.random_zone()
+            if zone_id in (103, 104, 105):  # Liberty/Ellis/Governors Island -> Financial District North
+                return self._by_id.get(87) or self.random_zone()
+            return self.random_zone()
         return self._by_id.get(zone_id) or self.random_zone()
 
     def random_zone(self) -> Zone:
